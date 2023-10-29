@@ -9,7 +9,7 @@ The train/eval performance is surely even a bit better under 10 random seeds.
 By contrast, the official implementation (shit code) is difficult to setup environment and difficult to debug and difficult to modify for academic experiments.
 
 ![train/val curves](/visual.png "train/val curves")
-Figure: SAVi-samll on MOVi-A.
+Figure: SAVi-small on MOVi-A.
 
 ## Features
 
