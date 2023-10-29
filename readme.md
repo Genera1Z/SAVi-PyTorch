@@ -41,10 +41,10 @@ Figure: SAVi-small on MOVi-A.
 
 ## How to Use
 
-- install requirements: ```pip install -r requirements.txt```
-- convert original MOVi-A into LMDB format: ```python datum.py```
-- run train and eval: ```python main.py``` or ```sh run.sh```
-- visualize the train/val curves: ```python analyze.py```
+- Install requirements: ```pip install -r requirements.txt```
+- Convert original MOVi-A into LMDB format: ```python datum.py```. But firstly download original dataset from here: https://console.cloud.google.com/storage/browser/kubric-public/tfds
+- Run train and eval: ```python main.py``` or ```sh run.sh```
+- Visualize the train/val curves: ```python analyze.py```
 
 ## About
 

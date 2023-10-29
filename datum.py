@@ -680,7 +680,7 @@ def main_convert_tfds_to_lmdb():
     [tf.config.experimental.set_memory_growth(_, True) for _ in _gpus]
 
     data_dir = "/media/GeneralZ/Storage/Static/datasets/tfds"  # XXX
-    tfds_name = "movi_a/128x128:1.0.0"  # XXX
+    tfds_name = "movi_b/128x128:1.0.0"  # XXX
     save_dir = pl.Path("./")  # XXX
     write_freq = 64
 
