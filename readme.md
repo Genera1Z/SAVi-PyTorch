@@ -11,6 +11,21 @@ By contrast, the official implementation (shit code) is difficult to setup envir
 ![train/val curves](/visual.png "train/val curves")
 Figure: SAVi-small on MOVi-A.
 
+## Stucture
+
+```
+- configs
+    └ savi_small-movi_a.py
+- output
+    └ {random seed}.txt  # my training log files
+- analyze.py    # visualize training logs
+- datum.py      # dataset and transforms
+- learn.py      # optimizers, lr schedulers, logging, etc.
+- main.py       # entry point
+- model.py      # modelling, initializing
+- utils.py      # config based registry and building APIs
+```
+
 ## Features
 
 - **3x faster training** The model can be trained 3 times faster compared with the official implementation (20 hours -> 7 hours @ GPU 3080 | batch_size=4).
