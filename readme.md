@@ -3,6 +3,7 @@
 ## About This Project
 
 Reimplemented by referring to the official code [https://github.com/google-research/slot-attention-video](https://github.com/google-research/slot-attention-video).
+ICLR 2022 Paper "Conditional Object-Centric Learning from Video".
 
 The train/eval performance is surely even a bit better under 10 random seeds.
 
