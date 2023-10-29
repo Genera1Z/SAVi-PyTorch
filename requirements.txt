@@ -1,0 +1,11 @@
+clu==0.0.3
+einops==0.7.0
+lmdb==1.4.1
+matplotlib==3.8.0
+numpy==1.26.1
+tensorflow_cpu==2.14.0
+tensorflow_datasets==4.9.0
+torch==2.1.0
+torchvision==0.16.0
+tqdm==4.66.1
+zstd==1.5.5.1

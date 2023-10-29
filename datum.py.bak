@@ -1,0 +1,511 @@
+import dataclasses as dc
+import os
+import pickle as pkl
+import time
+
+import cv2
+import lmdb
+import numpy as np
+import torch as pt
+import torch.utils.data as ptud
+import torchvision.transforms as ptvt
+import zstd as zs
+
+
+DataLoader = ptud.DataLoader
+
+
+BOXES = "boxes"
+DEPTH = "depth"
+FRAMES = "frames"
+FLOW = "flow"
+INSTANCE_LABELS = "instance_labels"
+NOTRACK_BOX = (0.0, 0.0, 0.0, 0.0)  # No-track bounding box for padding.
+PADDING_MASK = "padding_mask"
+RAGGED_BOXES = "ragged_boxes"
+SEGMENTATIONS = "segmentations"
+SHAPE = "shape"
+SPARSE_SEGMENTATIONS = "sparse_segmentations"
+VIDEO = "video"
+
+
+@dc.dataclass
+class VideoFromTfds:
+    video_key: str = VIDEO
+    segmentations_key: str = SEGMENTATIONS
+    shape_key: str = SHAPE
+    padding_mask_key: str = PADDING_MASK
+    ragged_boxes_key: str = RAGGED_BOXES
+    frames_key: str = FRAMES
+    flow_key: str = FLOW
+    depth_key: str = DEPTH
+
+    def __call__(self, features: dict) -> dict:
+        features_new = {}
+
+        if "instances" in features:
+            features_new[self.ragged_boxes_key] = features["instances"]["bboxes"]
+            features_new[self.frames_key] = features["instances"]["bbox_frames"]
+
+        if "segmentations" in features:
+            features_new[self.segmentations_key] = features["segmentations"][..., 0]
+
+        if "depth" in features:
+            depth_range = features["metadata"]["depth_range"]
+            features_new[self.depth_key] = self.convert_uint16_to_float32(
+                features["depth"], depth_range[0], depth_range[1]
+            )
+
+        if "backward_flow" in features:
+            features["flow"] = features["backward_flow"]
+            features["metadata"]["flow_range"] = features["metadata"][
+                "backward_flow_range"
+            ]
+        if "flow" in features:
+            flow_range = features["metadata"].get("flow_range", (-255, 255))
+            features_new[self.flow_key] = self.convert_uint16_to_float32(
+                features["flow"], flow_range[0], flow_range[1]
+            )
+
+        video = features["video"]
+        assert video.dtype == np.uint8
+
+        features_new[self.video_key] = video.astype("float32") / 255.0
+        features_new[self.shape_key] = np.array(video.shape)
+        features_new[self.padding_mask_key] = np.ones_like(video, "uint8")[..., 0]
+
+        return features_new
+
+    @staticmethod
+    def convert_uint16_to_float32(array, min_val, max_val):
+        return array.astype("float32") / 65535.0 * (max_val - min_val) + min_val
+
+
+@dc.dataclass
+class SparseToDenseAnnotation:
+    max_instances: int = 10
+    video_key: str = VIDEO
+    ragged_boxes_key: str = RAGGED_BOXES
+    boxes_key: str = BOXES
+    frames_key: str = FRAMES
+    segmentations_key: str = SEGMENTATIONS
+    instance_labels_key: str = INSTANCE_LABELS
+
+    def __call__(self, features: dict) -> dict:
+        updated_keys = {
+            self.video_key,
+            self.frames_key,
+            self.ragged_boxes_key,
+            self.segmentations_key,
+            self.instance_labels_key,
+        }
+        features_new = {k: v for k, v in features.items() if k not in updated_keys}
+
+        frames = features[self.frames_key]
+        video = features[self.video_key]
+        features_new[self.video_key] = video
+        num_frames = video.shape[0]
+        num_tracks = len(frames)
+
+        segmentations = features[self.segmentations_key]
+        segmentations = np.where(
+            np.less_equal(segmentations, self.max_instances), segmentations, 0
+        )
+        features_new[self.segmentations_key] = segmentations
+
+        bboxes = features[self.ragged_boxes_key]
+        boxes = np.stack(
+            [
+                self.densify_boxes(_, frames, bboxes, num_frames)
+                for _ in np.arange(np.minimum(num_tracks, self.max_instances))
+            ],
+            dtype="float32",
+        )
+        boxes = np.transpose(
+            self.crop_or_pad(boxes, self.max_instances, NOTRACK_BOX[0]), (1, 0, 2)
+        )
+        assert list(boxes.shape)[1:] == [self.max_instances, len(NOTRACK_BOX)]
+        features_new[self.boxes_key] = boxes
+        features_new[self.frames_key] = frames
+
+        return features_new
+
+    @staticmethod
+    def densify_boxes(n, frames, bboxes, num_frames):
+        boxes_n = np.tile([NOTRACK_BOX], (num_frames, 1))
+        idxs = np.array(frames[n])
+        boxes = np.array(bboxes[n])
+        assert (
+            len(boxes_n.shape) == 2 and len(idxs.shape) == 1 and len(boxes.shape) == 2
+        )
+        assert idxs.shape[0] == boxes.shape[0]
+        boxes_n[idxs] = boxes
+        return boxes_n
+
+    @staticmethod
+    def crop_or_pad(t, size, value, allow_crop=True):
+        pad_size = np.maximum(size - t.shape[0], 0)
+        t = np.pad(
+            t, ((0, pad_size),) + ((0, 0),) * (len(t.shape) - 1), constant_values=value
+        )
+        if allow_crop:
+            t = t[:size]
+        return t
+
+
+@dc.dataclass
+class VideoPreprocessOp:
+    video_key: str = VIDEO
+    segmentations_key: str = SEGMENTATIONS
+    padding_mask_key: str = PADDING_MASK
+    boxes_key: str = BOXES
+    flow_key: str = FLOW
+    depth_key: str = DEPTH
+    sparse_segmentations_key: str = SPARSE_SEGMENTATIONS
+
+    def __call__(self, features: dict) -> dict:
+        all_keys = [
+            self.video_key,
+            self.segmentations_key,
+            self.padding_mask_key,
+            self.flow_key,
+            self.depth_key,
+            self.boxes_key,
+        ]
+        for key in all_keys:
+            if key in features:
+                features[key] = self.apply(features[key], key)
+        return features
+
+    def apply(self, tensor: np.ndarray, key: str) -> np.ndarray:
+        raise "NotImplemented"
+
+
+@dc.dataclass
+class TemporalRandomStridedWindow(VideoPreprocessOp):
+    length: int = 6
+    """np.random.seed(int(time.time()))
+    cnt = np.random.randint(0, 2**16)"""
+
+    def apply(self, tensor, key):
+        # if key == self.boxes_key:
+        #     constant_value = NOTRACK_BOX[0]
+        # else:
+        #     constant_value = 0
+        """self.cnt += 1
+        np.random.seed(self.cnt)
+        seed = np.random.randint(0, 2**32)
+        np.random.seed(seed)"""
+        crop_point = np.random.randint(0, tensor.shape[0] - self.length + 1)
+        # print(self.cnt, crop_point)
+        frames = tensor[crop_point : crop_point + self.length]
+        # frame_to_pad = self.length - frames.shape[0]
+        # if frame_to_pad:
+        #     frames = np.pad(
+        #         frames,
+        #         ((0, frame_to_pad),) + ((0, 0),) * (len(frames.shape) - 1),
+        #         constant_values=constant_value,
+        #     )
+        assert frames.shape[0] == self.length
+        return frames
+
+
+@dc.dataclass
+class TemporalCropOrPad(VideoPreprocessOp):
+    length: int = 24
+
+    def apply(self, tensor, key):
+        # if key == self.boxes_key:
+        #     constant_value = NOTRACK_BOX[0]
+        # else:
+        #     constant_value = 0
+        # frame_to_pad = self.length - tensor.shape[0]
+        # if frame_to_pad:
+        #     tensor = np.pad(
+        #         tensor,
+        #         ((0, frame_to_pad),) + ((0, 0),) * (len(tensor.shape) - 1),
+        #         constant_values=constant_value,
+        #     )
+        tensor = tensor[: self.length]
+        assert list(tensor.shape) == [self.length, *tensor.shape[1:]]
+        return tensor
+
+
+@dc.dataclass
+class ResizeSmall(VideoPreprocessOp):
+    size: int = 128
+
+    def apply(self, tensor, key):
+        # Boxes are defined in normalized image coordinates and are not affected.
+        if key == self.boxes_key:
+            return tensor
+
+        if key in (self.padding_mask_key, self.segmentations_key):
+            tensor = tensor[..., None]
+        elif key == self.sparse_segmentations_key:
+            tensor = np.reshape(tensor, (-1, *tensor.shape[2:4], 1))
+
+        if isinstance(tensor.take(0).item(), int):
+            interp = cv2.INTER_NEAREST_EXACT
+        elif isinstance(tensor.take(0).item(), float):
+            interp = cv2.INTER_LINEAR
+        else:
+            raise "NotImplemented"
+
+        t, h, w, c = tensor.shape
+        h2, w2 = self.get_resize_small_shape((h, w), self.size)
+        tensor = np.stack(
+            [cv2.resize(_, [w2, h2], interpolation=interp) for _ in tensor]
+        )
+        if c == 1:  # cv2.resize removes channel=1, so add it back
+            tensor = tensor[..., None]
+
+        if key == self.flow_key:
+            scale = np.array([h2 / h, w2 / w], dtype="float32")[None, :]
+            scale = np.repeat(scale, tensor.shape[-1] // 2, axis=0)
+            scale = np.reshape(scale, (1, 1, 1, tensor.shape[-1]))
+            tensor *= scale
+
+        if key in [self.padding_mask_key, self.segmentations_key]:
+            tensor = tensor[..., 0]
+        elif key == self.sparse_segmentations_key:
+            tensor = np.reshape(tensor, [t, -1, h2, w2])
+
+        return tensor
+
+    @staticmethod
+    def get_resize_small_shape(original_size: tuple, small_size: int):
+        h, w = original_size
+        ratio = small_size / np.minimum(h, w)
+        h = np.round(h * ratio).astype("int32")
+        w = np.round(w * ratio).astype("int32")
+        return h, w
+
+
+@dc.dataclass
+class FlowToRgb:
+    flow_key: str = FLOW
+
+    def __call__(self, features: dict) -> dict:
+        if self.flow_key in features:
+            flow_rgb = self.flow_tensor_to_rgb_tensor(features[self.flow_key])
+            assert flow_rgb.dtype == np.uint8
+            features[self.flow_key] = flow_rgb.astype("float32") / 255.0
+        return features
+
+    @staticmethod
+    def flow_tensor_to_rgb_tensor(
+        motion_image,
+        flow_scaling_factor=50.0,
+        hsv_scale=np.array([180, 255, 255], "float32")[None, None, :],
+    ):
+        hypot = lambda a, b: (a**2.0 + b**2.0) ** 0.5  # sqrt(a^2 + b^2)
+        h, w = motion_image.shape[-3:-1]
+        scaling = flow_scaling_factor / hypot(h, w)
+        x, y = motion_image[..., 0], motion_image[..., 1]
+        motion_angle = np.arctan2(y, x)
+        motion_angle = (motion_angle / np.pi + 1.0) / 2.0
+        motion_magnitude = hypot(y, x)
+        motion_magnitude = np.clip(motion_magnitude * scaling, 0.0, 1.0)
+        value_channel = np.ones_like(motion_angle)
+        flow_hsv = np.stack([motion_angle, motion_magnitude, value_channel], axis=-1)
+        flow_hsv = (flow_hsv * hsv_scale).astype("uint8")
+        flow_rgb = np.stack([cv2.cvtColor(_, cv2.COLOR_HSV2RGB) for _ in flow_hsv])
+        return flow_rgb
+
+
+# https://gregoryszorc.com/blog/2017/03/07/better-compression-with-zstandard/
+compress = lambda _: zs.compress(pkl.dumps(_, pkl.HIGHEST_PROTOCOL))
+decompress = lambda _: pkl.loads(zs.decompress(_))
+
+
+class MoviLmdb(ptud.Dataset):
+    """"""
+
+    def __init__(self, data_file, transform, max_spare=4):
+        super().__init__()
+        self.env = lmdb.open(
+            str(data_file),
+            subdir=False,
+            readonly=True,
+            readahead=False,
+            meminit=False,
+            max_spare_txns=max_spare,
+            lock=False,
+        )
+        with self.env.begin(write=False) as txn:
+            self.keys = decompress(txn.get(b"__keys__"))
+        self.transform = ptvt.Compose(transform)
+
+    def __getitem__(
+        self, index, permute_keys=("depth", "flow", "video"), pop_keys=("frames",)
+    ):
+        with self.env.begin(write=False) as txn:
+            sample = decompress(txn.get(self.keys[index]))
+        sample = self.transform(sample)
+        sample2 = {}
+        for key, value in sample.items():
+            if key in pop_keys:
+                continue
+            if key in permute_keys:
+                assert len(value.shape) == 4
+                value = np.transpose(value, [0, 3, 1, 2])
+            sample2[key] = value
+        return sample2
+
+    def __len__(self):
+        return len(self.keys)
+
+    @staticmethod
+    def collate_fn(samples: list) -> dict:
+        assert isinstance(samples, list) and isinstance(samples[0], dict)
+        batch = {}
+        for key, value in samples[0].items():
+            values = [_[key] for _ in samples]
+            if isinstance(value, dict):
+                values2 = MoviLmdb.collate_fn(values)
+            elif isinstance(value, np.ndarray):
+                values2 = pt.from_numpy(np.stack(values))
+            elif isinstance(value, list):
+                values2 = values
+            else:
+                raise "NotImplemented"
+            batch[key] = values2
+        return batch
+
+
+####
+
+
+def main_convert_tfds_to_lmdb():
+    """Convert the original TFRecord files into one LMDB file, saving 80% storage space."""
+    import time
+    import pathlib as pl
+
+    from clu import deterministic_data
+    import tensorflow as tf
+    import tensorflow.python.framework.ops as tfpfo
+    import tensorflow_datasets as tfds
+
+    _gpus = tf.config.list_physical_devices("GPU")
+    [tf.config.experimental.set_memory_growth(_, True) for _ in _gpus]
+
+    def _convert_nested_mapping(mapping: dict):
+        mapping2 = {}
+        for key, value in mapping.items():
+            if isinstance(value, dict):
+                value2 = _convert_nested_mapping(value)
+            elif isinstance(value, tfpfo.EagerTensor):
+                value2 = value.numpy()
+            elif isinstance(value, tf.RaggedTensor):
+                value2 = value.to_list()
+            else:
+                raise "NotImplemented"
+            mapping2[key] = value2
+        return mapping2
+
+    data_dir = "/media/GeneralZ/Storage/Static/datasets/tfds"
+    tfds_name = "movi_a/128x128:1.0.0"
+    save_dir = pl.Path("./")
+    write_freq = 64
+
+    for split in ["train", "validation"]:
+        print(split)
+
+        dataset_builder = tfds.builder(tfds_name, data_dir=data_dir)
+        train_split = deterministic_data.get_read_instruction_for_host(
+            split,
+            dataset_builder.info.splits[split].num_examples,
+        )
+        dataset = deterministic_data.create_dataset(
+            dataset_builder, split=train_split, num_epochs=1, shuffle=False
+        )
+
+        lmdb_file = str(save_dir / split)
+        env = lmdb.open(
+            lmdb_file, map_size=1024**4, subdir=False, readonly=False, meminit=False
+        )
+
+        keys = []
+        txn = env.begin(write=True)
+        t0 = time.time()
+        for i, sample in enumerate(dataset):
+            if i % write_freq == 0:
+                print(f"{i:06d}")
+                txn.commit()
+                txn = env.begin(write=True)
+            sample2 = _convert_nested_mapping(sample)
+            sample_key = f"{i:06d}".encode("ascii")
+            keys.append(sample_key)
+            txn.put(sample_key, compress(sample2))
+
+        txn.commit()
+        print((time.time() - t0) / (i + 1))  # 0.0298842241987586
+
+        txn = env.begin(write=True)
+        txn.put(b"__keys__", compress(keys))
+        txn.commit()
+        env.close()
+
+
+def main_lmdb():
+    """Wrap the LMDB file reading into PyTorch Dataset object,
+    which is much faster than the original TFRecord version.
+    As compressed 5x, the dataset can be put in RAM disk /dev/shm/ for extra speed.
+    """
+    TRANSFORM_TRAIN = (
+        VideoFromTfds(),
+        SparseToDenseAnnotation(max_instances=23),
+        TemporalRandomStridedWindow(length=6),  # 24|6
+        ResizeSmall(size=64),  # 128|64
+        FlowToRgb(),
+    )
+    TRANSFORM_EVAL = (
+        VideoFromTfds(),
+        SparseToDenseAnnotation(max_instances=23),
+        TemporalCropOrPad(length=24),
+        ResizeSmall(size=64),  # 128|64
+        FlowToRgb(),
+    )
+    batch_size = 16
+    num_worker = min(16, batch_size)  # os.cpu_count()
+    movi = MoviLmdb(
+        "/dev/shm/movi_a/train", transform=TRANSFORM_TRAIN, max_spare=num_worker
+    )
+    dataloader = ptud.DataLoader(
+        movi,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_worker,
+        collate_fn=MoviLmdb.collate_fn,
+    )
+    t0 = time.time()
+    for i, batch in enumerate(dataloader):
+        print("#" * 10, i, {k: list(v.shape) for k, v in batch.items()})
+    print((time.time() - t0) / (i + 1))  # 0.029463951827273925
+
+
+if __name__ == "__main__":
+    # main_tfds_official()
+    # main_tfds_reduced()
+    # main_convert_tfds_to_lmdb()
+    main_lmdb()
+
+"""
+'instances', 
+    'quaternions', 'angular_velocities', 'material_label', 'friction', 'size_label', 'velocities', 'restitution', 'color', 'mass', 'color_label', 'bboxes', 'image_positions', 'bbox_frames', 'positions', 'shape_label', 'visibility', 'bboxes_3d'
+'events', 
+    collisions
+        'position', 'instances', 'force', 'frame', 'image_position', 'contact_normal'
+'metadata', 
+    'height', 'forward_flow_range', 'backward_flow_range', 'width', 'depth_range', 'num_frames', 'num_instances', 'video_name'
+'backward_flow', 
+'camera', 
+    'quaternions', 'field_of_view', 'positions', 'focal_length', 'sensor_width'
+'normal', 
+'object_coordinates', 
+'depth', 
+'segmentations', 
+'video', 
+'forward_flow'
+"""
